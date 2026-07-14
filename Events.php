@@ -12,6 +12,7 @@ use humhub\helpers\ControllerHelper;
 use humhub\modules\admin\controllers\UserController as AdminUserController;
 use humhub\modules\admin\grid\UserActionColumn;
 use humhub\modules\admin\permissions\ManageUsers;
+use humhub\modules\twofa\controllers\CheckController;
 use humhub\modules\twofa\events\BeforeCheck;
 use humhub\modules\twofa\helpers\TwofaHelper;
 use humhub\modules\twofa\helpers\TwofaUrl;
@@ -58,7 +59,7 @@ class Events
     public static function onBeforeAction($event)
     {
         if (Yii::$app->user->mustChangePassword()) {
-            return false;
+            return;
         }
 
         /** @var Controller $controller */
@@ -68,20 +69,52 @@ class Events
             Yii::$app->session->set('twofa.switchedUserId', Yii::$app->user->id);
         }
 
-        if (
-            $controller->module->id === 'fcm-push'
-            && $controller->id === 'token'
-            && $controller->action->id === 'update'
-        ) {
-            return false;
+        // Another event handler (e.g. from a module intercepting the same action) has
+        // already canceled or redirected the current action; overriding its redirect
+        // could produce a redirect loop between the two modules
+        if (!$event->isValid || Yii::$app->response->getIsRedirection()) {
+            return;
+        }
+
+        // Twofa-own allowlist — deliberately NOT the generic $doNotInterceptActionIds
+        // flag: that flag is set by controllers for unrelated reasons (e.g. the REST
+        // module, live polling, account deletion) and honoring it would exempt those
+        // actions from the second factor. Every entry here is a security decision.
+        if (self::isTwofaExemptRoute($controller, $event)) {
+            return;
         }
 
         $beforeVerifying = new BeforeCheck();
         Yii::$app->trigger($beforeVerifying->name, $beforeVerifying);
 
-        if (!$beforeVerifying->handled && TwofaHelper::isVerifyingRequired() && !Yii::$app->getModule('twofa')->isTwofaCheckUrl()) {
-            return Yii::$app->response->redirect(TwofaUrl::toCheck());
+        if (!$beforeVerifying->handled && TwofaHelper::isVerifyingRequired()) {
+            $event->isValid = false;
+            Yii::$app->response->redirect(TwofaUrl::toCheck());
         }
+    }
+
+    /**
+     * Routes that stay reachable while the two-factor verification is pending.
+     *
+     * @param $controller Controller
+     * @return bool
+     */
+    protected static function isTwofaExemptRoute($controller, $event): bool
+    {
+        // The 2fa check page itself — redirecting it would loop onto itself
+        if ($controller instanceof CheckController) {
+            return true;
+        }
+
+        // Login and logout must stay reachable
+        if ($controller instanceof AuthController) {
+            return true;
+        }
+
+        // The mobile app updates its push token in the background
+        return $controller->module->id === 'fcm-push'
+            && $controller->id === 'token'
+            && $event->action->id === 'update';
     }
 
     /**
